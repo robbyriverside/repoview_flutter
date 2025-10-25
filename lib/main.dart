@@ -1,5 +1,13 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+
+import 'package:repoview_flutter/rvg/rvg_models.dart';
+import 'package:repoview_flutter/rvg/rvg_persistence_service.dart';
+import 'package:repoview_flutter/rvg/rvg_types.dart';
+import 'package:repoview_flutter/rvg/rvg_sync_service.dart';
 
 void main() {
   runApp(const GraphApp());
@@ -16,6 +24,7 @@ class GraphApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
+      debugShowCheckedModeBanner: false,
       home: const GraphPage(),
     );
   }
@@ -31,93 +40,78 @@ class GraphPage extends StatefulWidget {
 class _GraphPageState extends State<GraphPage> {
   static const Size _canvasSize = Size(1400, 900);
 
+  late final RvgPersistenceService _persistenceService;
+  late final GraphUndoManager _undoManager;
+  late final File _documentFile;
+  late final Directory _workspaceRoot;
+  late final RvgSyncService _syncService;
   late final Map<GraphShapeType, GraphShapeDelegate> _shapeRegistry;
+  late RvgDocument _document;
   late List<GraphNode> _nodes;
   String? _selectedNodeId;
+  bool _isSyncing = false;
+  StreamSubscription<FileSystemEvent>? _watchSubscription;
+  Timer? _syncDebounce;
+  RvgDocument? _dragSnapshot;
 
   @override
   void initState() {
     super.initState();
+    _persistenceService = const RvgPersistenceService();
+    _undoManager = GraphUndoManager(capacity: 50);
+    _syncService = const RvgSyncService();
+    _workspaceRoot = Directory(
+      '${Directory.systemTemp.path}/repoview-demo-workspace',
+    );
+    _documentFile = File('${_workspaceRoot.path}/.repoview.rvg');
     _shapeRegistry = {
       GraphShapeType.rectangle: const RectangleNodeShape(),
       GraphShapeType.circle: const CircleNodeShape(),
     };
-    _nodes = [
-      GraphNode(
-        id: 'api',
-        label: 'API Gateway',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(180, 160),
-        size: const Size(200, 96),
-        connections: const ['auth', 'orders', 'analytics'],
-      ),
-      GraphNode(
-        id: 'auth',
-        label: 'Auth Service',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(520, 120),
-        size: const Size(190, 90),
-        connections: const ['users'],
-      ),
-      GraphNode(
-        id: 'orders',
-        label: 'Orders',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(520, 340),
-        size: const Size(190, 90),
-        connections: const ['payments', 'shipments'],
-      ),
-      GraphNode(
-        id: 'analytics',
-        label: 'Analytics',
-        shape: GraphShapeType.circle,
-        position: const Offset(260, 480),
-        size: const Size(160, 160),
-        connections: const ['warehouse'],
-      ),
-      GraphNode(
-        id: 'users',
-        label: 'Users DB',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(820, 80),
-        size: const Size(200, 96),
-      ),
-      GraphNode(
-        id: 'payments',
-        label: 'Payments',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(820, 300),
-        size: const Size(200, 96),
-        connections: const ['ledger'],
-      ),
-      GraphNode(
-        id: 'shipments',
-        label: 'Shipments',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(820, 460),
-        size: const Size(200, 96),
-      ),
-      GraphNode(
-        id: 'warehouse',
-        label: 'Warehouse\nReporting',
-        shape: GraphShapeType.rectangle,
-        position: const Offset(560, 560),
-        size: const Size(220, 110),
-      ),
-      GraphNode(
-        id: 'ledger',
-        label: 'Finance Ledger',
-        shape: GraphShapeType.circle,
-        position: const Offset(1100, 320),
-        size: const Size(150, 150),
-      ),
-    ];
+    _document = RvgDocument.demo();
+    _nodes = _document.nodes.map(GraphNode.fromRvgNode).toList();
+    unawaited(_bootstrapWorkspace());
+  }
+
+  @override
+  void dispose() {
+    _watchSubscription?.cancel();
+    _syncDebounce?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Graph Connectivity Playground')),
+      appBar: AppBar(
+        title: const Text('Graph Connectivity Playground'),
+        actions: [
+          IconButton(
+            tooltip: 'Undo',
+            icon: const Icon(Icons.undo),
+            onPressed: _undoManager.canUndo ? _handleUndo : null,
+          ),
+          IconButton(
+            tooltip: 'Redo',
+            icon: const Icon(Icons.redo),
+            onPressed: _undoManager.canRedo ? _handleRedo : null,
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            tooltip: 'Sync workspace',
+            icon:
+                _isSyncing
+                    ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2.2),
+                    )
+                    : const Icon(Icons.sync),
+            onPressed: _isSyncing ? null : () => unawaited(_runSync()),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
       body: InteractiveViewer(
         minScale: 0.6,
         maxScale: 2.8,
@@ -163,6 +157,8 @@ class _GraphPageState extends State<GraphPage> {
       left: node.position.dx,
       top: node.position.dy,
       child: GestureDetector(
+        onPanStart: (_) => _beginNodeDrag(),
+        onPanEnd: (_) => _endNodeDrag(),
         onTap: () => _handleNodeTap(node),
         onPanUpdate: (details) => _handleNodePan(node.id, details.delta),
         child: _buildNodeShadow(
@@ -205,12 +201,174 @@ class _GraphPageState extends State<GraphPage> {
     );
   }
 
-  void _handleNodePan(String nodeId, Offset delta) {
-    final nodeIndex = _nodes.indexWhere((element) => element.id == nodeId);
-    if (nodeIndex == -1) {
+  Future<void> _bootstrapWorkspace() async {
+    try {
+      if (!await _workspaceRoot.exists()) {
+        await _workspaceRoot.create(recursive: true);
+      }
+      final File readme = File('${_workspaceRoot.path}/README.md');
+      if (!await readme.exists()) {
+        await readme.writeAsString(
+          '# RepoView Demo Workspace\n\n'
+          'This folder is auto-generated so the demo can sync files into the graph.\n',
+        );
+      }
+      final File notes = File('${_workspaceRoot.path}/notes.txt');
+      if (!await notes.exists()) {
+        await notes.writeAsString(
+          'Add files here to see them appear inside the RepoView graph.\n',
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Failed to prepare workspace: $error');
+      debugPrint('$stackTrace');
+    }
+
+    await _initializeDocumentFromDisk();
+    await _runSync(silent: true);
+    _startWatching();
+  }
+
+  Future<void> _initializeDocumentFromDisk() async {
+    try {
+      final RvgDocument loaded = await _persistenceService.loadOrCreate(
+        _documentFile,
+        fallback: _document,
+      );
+      _undoManager.reset();
+      _dragSnapshot = null;
+      setState(() {
+        _document = loaded;
+        _nodes = loaded.nodes.map(GraphNode.fromRvgNode).toList();
+      });
+    } on RvgPersistenceException catch (error) {
+      debugPrint(error.toString());
+    } catch (error, stackTrace) {
+      debugPrint('Unexpected error loading RVG document: $error');
+      debugPrint('$stackTrace');
+    }
+  }
+
+  void _commitDocument(
+    RvgDocument document, {
+    bool clearSelection = false,
+    String? nextSelection,
+    bool recordUndo = false,
+    bool persist = true,
+  }) {
+    if (recordUndo) {
+      _undoManager.push(_document);
+    }
+    setState(() {
+      _document = document;
+      _nodes = document.nodes.map(GraphNode.fromRvgNode).toList();
+      if (clearSelection) {
+        _selectedNodeId = null;
+      } else if (nextSelection != null) {
+        _selectedNodeId = nextSelection;
+      }
+    });
+    if (!persist) {
       return;
     }
-    final node = _nodes[nodeIndex];
+    unawaited(_persistDocument(document));
+  }
+
+  Future<void> _persistDocument(RvgDocument document) async {
+    try {
+      await _persistenceService.saveToFile(_documentFile, document);
+    } on RvgPersistenceException catch (error) {
+      debugPrint(error.toString());
+    } catch (error, stackTrace) {
+      debugPrint('Unexpected error saving RVG document: $error');
+      debugPrint('$stackTrace');
+    }
+  }
+
+  Future<void> _runSync({bool silent = false}) async {
+    if (_isSyncing) {
+      return;
+    }
+
+    void setSyncing(bool value) {
+      if (!mounted) {
+        _isSyncing = value;
+        return;
+      }
+      if (silent) {
+        _isSyncing = value;
+      } else {
+        setState(() {
+          _isSyncing = value;
+        });
+      }
+    }
+
+    setSyncing(true);
+    try {
+      final RvgSyncResult result = await _syncService.syncWithDirectory(
+        document: _document,
+        workspaceRoot: _workspaceRoot,
+      );
+      if (!identical(result.document, _document)) {
+        _commitDocument(result.document);
+      }
+      for (final String warning in result.warnings) {
+        debugPrint('Sync warning: $warning');
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Failed to sync workspace: $error');
+      debugPrint('$stackTrace');
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  void _startWatching() {
+    _watchSubscription?.cancel();
+    _watchSubscription = _workspaceRoot
+        .watch(recursive: true)
+        .listen(
+          (FileSystemEvent event) {
+            // Ignore events on the RVG file itself to avoid loops.
+            if (event.path == _documentFile.path) {
+              return;
+            }
+            _scheduleSilentSync();
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            debugPrint('Watcher error: $error');
+            debugPrint('$stackTrace');
+          },
+          cancelOnError: false,
+        );
+  }
+
+  void _scheduleSilentSync() {
+    _syncDebounce?.cancel();
+    _syncDebounce = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_runSync(silent: true));
+    });
+  }
+
+  GraphNode? _findNodeById(String id) {
+    for (final GraphNode node in _nodes) {
+      if (node.id == id) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  void _handleNodePan(String nodeId, Offset delta) {
+    final GraphNode? node = _findNodeById(nodeId);
+    if (node == null) {
+      return;
+    }
+
     final Offset rawPosition = node.position + delta;
     final double maxX = _canvasSize.width - node.size.width;
     final double maxY = _canvasSize.height - node.size.height;
@@ -220,13 +378,13 @@ class _GraphPageState extends State<GraphPage> {
       rawPosition.dy.clamp(0.0, maxY < 0 ? 0.0 : maxY).toDouble(),
     );
 
-    final GraphNode updatedNode = node.copyWith(position: boundedPosition);
-
-    setState(() {
-      final List<GraphNode> updatedNodes = List<GraphNode>.from(_nodes);
-      updatedNodes[nodeIndex] = updatedNode;
-      _nodes = updatedNodes;
-    });
+    final RvgDocument updatedDocument = _document.updateNode(
+      nodeId,
+      (RvgNode original) => original.copyWith(position: boundedPosition),
+    );
+    if (!identical(updatedDocument, _document)) {
+      _commitDocument(updatedDocument);
+    }
   }
 
   void _handleNodeTap(GraphNode tappedNode) {
@@ -243,39 +401,49 @@ class _GraphPageState extends State<GraphPage> {
       return;
     }
 
-    final List<GraphNode>? updatedNodes = _toggleConnection(
-      activeSource,
-      tappedId,
-    );
-    if (updatedNodes != null) {
-      setState(() {
-        _nodes = updatedNodes;
-        _selectedNodeId = null;
-      });
-    } else {
-      setState(() {
-        _selectedNodeId = null;
-      });
+    final RvgDocument updatedDocument = _document.updateNode(activeSource, (
+      RvgNode source,
+    ) {
+      final bool hasEdge = source.connections.contains(tappedId);
+      final List<String> updatedConnections =
+          hasEdge
+              ? source.connections.where((String id) => id != tappedId).toList()
+              : <String>[...source.connections, tappedId];
+      return source.copyWith(connections: updatedConnections);
+    });
+    if (identical(updatedDocument, _document)) {
+      setState(() => _selectedNodeId = null);
+      return;
     }
+    _commitDocument(updatedDocument, clearSelection: true, recordUndo: true);
   }
 
-  List<GraphNode>? _toggleConnection(String fromId, String toId) {
-    final int fromIndex = _nodes.indexWhere((node) => node.id == fromId);
-    final int toIndex = _nodes.indexWhere((node) => node.id == toId);
-    if (fromIndex == -1 || toIndex == -1) {
-      return null;
+  void _beginNodeDrag() {
+    _dragSnapshot ??= _document;
+  }
+
+  void _endNodeDrag() {
+    if (_dragSnapshot != null && !identical(_dragSnapshot, _document)) {
+      _undoManager.push(_dragSnapshot!);
+      setState(() {});
     }
+    _dragSnapshot = null;
+  }
 
-    final GraphNode source = _nodes[fromIndex];
-    final bool hasEdge = source.connections.contains(toId);
-    final List<String> updatedConnections =
-        hasEdge
-            ? source.connections.where((id) => id != toId).toList()
-            : [...source.connections, toId];
+  void _handleUndo() {
+    final RvgDocument? previous = _undoManager.undo(_document);
+    if (previous == null) {
+      return;
+    }
+    _commitDocument(previous, clearSelection: true, recordUndo: false);
+  }
 
-    final List<GraphNode> updatedNodes = List<GraphNode>.from(_nodes);
-    updatedNodes[fromIndex] = source.copyWith(connections: updatedConnections);
-    return updatedNodes;
+  void _handleRedo() {
+    final RvgDocument? next = _undoManager.redo(_document);
+    if (next == null) {
+      return;
+    }
+    _commitDocument(next, clearSelection: true, recordUndo: false);
   }
 }
 
@@ -290,7 +458,10 @@ class GraphNode {
     required this.shape,
     required this.position,
     required this.size,
-    this.connections = const [],
+    this.connections = const <String>[],
+    this.visualType = RvgVisualType.rectangle,
+    this.sourcePath,
+    this.metadata = const <String, dynamic>{},
   });
 
   final String id;
@@ -299,6 +470,36 @@ class GraphNode {
   final Offset position;
   final Size size;
   final List<String> connections;
+  final RvgVisualType visualType;
+  final String? sourcePath;
+  final Map<String, dynamic> metadata;
+
+  factory GraphNode.fromRvgNode(RvgNode node) {
+    return GraphNode(
+      id: node.id,
+      label: node.label,
+      shape: _shapeFromVisual(node.visual),
+      position: node.position,
+      size: node.size,
+      connections: List<String>.unmodifiable(node.connections),
+      visualType: node.visual,
+      sourcePath: node.filePath,
+      metadata: Map<String, dynamic>.unmodifiable(node.metadata),
+    );
+  }
+
+  RvgNode toRvgNode() {
+    return RvgNode(
+      id: id,
+      label: label,
+      visual: visualType,
+      position: position,
+      size: size,
+      connections: List<String>.from(connections),
+      filePath: sourcePath,
+      metadata: Map<String, dynamic>.from(metadata),
+    );
+  }
 
   GraphNode copyWith({
     String? id,
@@ -307,16 +508,83 @@ class GraphNode {
     Offset? position,
     Size? size,
     List<String>? connections,
+    RvgVisualType? visualType,
+    String? sourcePath,
+    Map<String, dynamic>? metadata,
   }) {
+    final GraphShapeType resolvedShape = shape ?? this.shape;
+    final RvgVisualType resolvedVisualType =
+        visualType ??
+        (shape != null ? _visualFromShape(shape) : this.visualType);
     return GraphNode(
       id: id ?? this.id,
       label: label ?? this.label,
-      shape: shape ?? this.shape,
+      shape: resolvedShape,
       position: position ?? this.position,
       size: size ?? this.size,
-      connections: connections ?? this.connections,
+      connections: connections ?? List<String>.from(this.connections),
+      visualType: resolvedVisualType,
+      sourcePath: sourcePath ?? this.sourcePath,
+      metadata: metadata ?? Map<String, dynamic>.from(this.metadata),
     );
   }
+
+  static GraphShapeType _shapeFromVisual(RvgVisualType visual) {
+    switch (visual) {
+      case RvgVisualType.circle:
+        return GraphShapeType.circle;
+      case RvgVisualType.rectangle:
+      case RvgVisualType.folder:
+      case RvgVisualType.file:
+      case RvgVisualType.external:
+      case RvgVisualType.note:
+        return GraphShapeType.rectangle;
+    }
+  }
+
+  static RvgVisualType _visualFromShape(GraphShapeType shape) {
+    switch (shape) {
+      case GraphShapeType.circle:
+        return RvgVisualType.circle;
+      case GraphShapeType.rectangle:
+        return RvgVisualType.rectangle;
+    }
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is GraphNode &&
+        other.id == id &&
+        other.label == label &&
+        other.shape == shape &&
+        other.position == position &&
+        other.size == size &&
+        listEquals(other.connections, connections) &&
+        other.visualType == visualType &&
+        other.sourcePath == sourcePath &&
+        mapEquals(other.metadata, metadata);
+  }
+
+  @override
+  int get hashCode => Object.hashAll(<Object?>[
+    id,
+    label,
+    shape,
+    position.dx,
+    position.dy,
+    size.width,
+    size.height,
+    Object.hashAll(connections),
+    visualType,
+    sourcePath,
+    Object.hashAll(
+      metadata.entries.map(
+        (MapEntry<String, dynamic> entry) =>
+            Object.hash(entry.key, entry.value),
+      ),
+    ),
+  ]);
 }
 
 @immutable
@@ -348,29 +616,64 @@ class RectangleNodeShape extends GraphShapeDelegate {
     required bool isSelected,
     required ThemeData theme,
   }) {
+    Color background = isSelected ? Colors.indigo.shade50 : Colors.white;
+    Color borderColor = isSelected ? Colors.indigo : Colors.grey.shade400;
+    double borderWidth = isSelected ? 3 : 1.6;
+    EdgeInsets padding = const EdgeInsets.all(16);
+    BorderRadius borderRadius = BorderRadius.circular(14);
+    Widget child = _buildDefaultRectangularContent(node, theme, isSelected);
+
+    switch (node.visualType) {
+      case RvgVisualType.folder:
+        background = isSelected ? Colors.amber.shade100 : Colors.amber.shade50;
+        borderColor =
+            isSelected ? Colors.amber.shade700 : Colors.amber.shade200;
+        borderWidth = isSelected ? 3 : 2;
+        padding = const EdgeInsets.fromLTRB(18, 16, 18, 14);
+        child = _buildFolderContent(node, theme);
+        break;
+      case RvgVisualType.file:
+        background =
+            isSelected ? Colors.blueGrey.shade100 : Colors.blueGrey.shade50;
+        borderColor =
+            isSelected ? Colors.blueGrey.shade700 : Colors.blueGrey.shade200;
+        borderWidth = isSelected ? 3 : 1.8;
+        padding = const EdgeInsets.fromLTRB(18, 14, 18, 14);
+        child = _buildFileContent(node, theme);
+        break;
+      case RvgVisualType.note:
+        background =
+            isSelected ? Colors.orange.shade100 : Colors.orange.shade50;
+        borderColor =
+            isSelected ? Colors.orange.shade700 : Colors.orange.shade200;
+        borderWidth = isSelected ? 3 : 2;
+        padding = const EdgeInsets.fromLTRB(18, 18, 18, 16);
+        child = _buildNoteContent(node, theme);
+        break;
+      case RvgVisualType.external:
+        background =
+            isSelected ? Colors.teal.shade100 : Colors.tealAccent.shade100;
+        borderColor = isSelected ? Colors.teal.shade700 : Colors.teal.shade200;
+        borderWidth = isSelected ? 3 : 2;
+        padding = const EdgeInsets.fromLTRB(18, 16, 18, 16);
+        child = _buildExternalContent(node, theme);
+        break;
+      case RvgVisualType.rectangle:
+      case RvgVisualType.circle:
+        // Use defaults; circle handled by CircleNodeShape.
+        break;
+    }
+
     return Container(
       width: node.size.width,
       height: node.size.height,
-      padding: const EdgeInsets.all(16),
+      padding: padding,
       decoration: BoxDecoration(
-        color: isSelected ? Colors.indigo.shade50 : Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: isSelected ? Colors.indigo : Colors.grey.shade400,
-          width: isSelected ? 3 : 1.6,
-        ),
+        color: background,
+        borderRadius: borderRadius,
+        border: Border.all(color: borderColor, width: borderWidth),
       ),
-      alignment: Alignment.center,
-      child: Text(
-        node.label,
-        textAlign: TextAlign.center,
-        style:
-            theme.textTheme.titleMedium?.copyWith(
-              color: Colors.black87,
-              fontWeight: FontWeight.w600,
-            ) ??
-            const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-      ),
+      child: child,
     );
   }
 
@@ -459,6 +762,251 @@ class CircleNodeShape extends GraphShapeDelegate {
         return center.translate(-diameter / 2, 0);
     }
   }
+}
+
+Widget _buildDefaultRectangularContent(
+  GraphNode node,
+  ThemeData theme,
+  bool isSelected,
+) {
+  final TextStyle style =
+      theme.textTheme.titleMedium?.copyWith(
+        color: Colors.black87,
+        fontWeight: FontWeight.w600,
+      ) ??
+      const TextStyle(fontSize: 16, fontWeight: FontWeight.w600);
+  return Center(
+    child: Text(
+      node.label,
+      textAlign: TextAlign.center,
+      maxLines: 3,
+      overflow: TextOverflow.ellipsis,
+      style: style,
+    ),
+  );
+}
+
+Widget _buildFolderContent(GraphNode node, ThemeData theme) {
+  final TextStyle titleStyle =
+      theme.textTheme.titleMedium?.copyWith(
+        color: Colors.amber.shade900,
+        fontWeight: FontWeight.w700,
+      ) ??
+      TextStyle(
+        color: Colors.amber.shade900,
+        fontSize: 16,
+        fontWeight: FontWeight.w700,
+      );
+  final TextStyle bodyStyle =
+      theme.textTheme.bodyMedium?.copyWith(color: Colors.brown.shade600) ??
+      TextStyle(color: Colors.brown.shade600, fontSize: 13);
+  final String relativePath = _relativePathFor(node);
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      Row(
+        children: [
+          Icon(Icons.folder, color: Colors.amber.shade700),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              node.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: titleStyle,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 10),
+      _buildMetadataLine(
+        icon: Icons.folder_open,
+        iconColor: Colors.amber.shade700,
+        text: relativePath,
+        style: bodyStyle,
+      ),
+    ],
+  );
+}
+
+Widget _buildFileContent(GraphNode node, ThemeData theme) {
+  final TextStyle titleStyle =
+      theme.textTheme.titleMedium?.copyWith(
+        color: Colors.blueGrey.shade900,
+        fontWeight: FontWeight.w700,
+      ) ??
+      TextStyle(
+        color: Colors.blueGrey.shade900,
+        fontSize: 16,
+        fontWeight: FontWeight.w700,
+      );
+  final TextStyle bodyStyle =
+      theme.textTheme.bodyMedium?.copyWith(color: Colors.blueGrey.shade600) ??
+      TextStyle(color: Colors.blueGrey.shade600, fontSize: 13);
+  final String relativePath = _relativePathFor(node);
+  final String origin = (node.metadata['origin'] as String?) ?? 'manual';
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      Row(
+        children: [
+          Icon(
+            Icons.insert_drive_file_outlined,
+            color: Colors.blueGrey.shade700,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              node.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: titleStyle,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      _buildMetadataLine(
+        icon: Icons.folder,
+        iconColor: Colors.blueGrey.shade400,
+        text: relativePath,
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 4),
+      _buildMetadataLine(
+        icon: Icons.link,
+        iconColor: Colors.blueGrey.shade400,
+        text: origin == 'filesystem' ? 'Synced file' : 'Linked asset',
+        style: bodyStyle,
+      ),
+    ],
+  );
+}
+
+Widget _buildNoteContent(GraphNode node, ThemeData theme) {
+  final TextStyle titleStyle =
+      theme.textTheme.titleMedium?.copyWith(
+        color: Colors.deepOrange.shade900,
+        fontWeight: FontWeight.w700,
+      ) ??
+      TextStyle(
+        color: Colors.deepOrange.shade900,
+        fontSize: 16,
+        fontWeight: FontWeight.w700,
+      );
+  final TextStyle bodyStyle =
+      theme.textTheme.bodyMedium?.copyWith(color: Colors.deepOrange.shade600) ??
+      TextStyle(color: Colors.deepOrange.shade600, fontSize: 13);
+  final String? noteBody = node.metadata['body'] as String?;
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      Row(
+        children: [
+          Icon(Icons.sticky_note_2_outlined, color: Colors.deepOrange.shade400),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              node.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: titleStyle,
+            ),
+          ),
+        ],
+      ),
+      if (noteBody != null && noteBody.trim().isNotEmpty) ...[
+        const SizedBox(height: 10),
+        Text(
+          noteBody.trim(),
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+          style: bodyStyle,
+        ),
+      ],
+    ],
+  );
+}
+
+Widget _buildExternalContent(GraphNode node, ThemeData theme) {
+  final TextStyle titleStyle =
+      theme.textTheme.titleMedium?.copyWith(
+        color: Colors.teal.shade900,
+        fontWeight: FontWeight.w700,
+      ) ??
+      TextStyle(
+        color: Colors.teal.shade900,
+        fontSize: 16,
+        fontWeight: FontWeight.w700,
+      );
+  final TextStyle bodyStyle =
+      theme.textTheme.bodyMedium?.copyWith(color: Colors.teal.shade700) ??
+      TextStyle(color: Colors.teal.shade700, fontSize: 13);
+  final String source =
+      node.sourcePath ??
+      (node.metadata['source'] as String?) ??
+      'External reference';
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      Row(
+        children: [
+          Icon(Icons.public, color: Colors.teal.shade600),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              node.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: titleStyle,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      _buildMetadataLine(
+        icon: Icons.link,
+        iconColor: Colors.teal.shade400,
+        text: source,
+        style: bodyStyle,
+      ),
+    ],
+  );
+}
+
+Widget _buildMetadataLine({
+  required IconData icon,
+  required Color iconColor,
+  required String text,
+  required TextStyle style,
+}) {
+  return Row(
+    crossAxisAlignment: CrossAxisAlignment.center,
+    children: [
+      Icon(icon, size: 18, color: iconColor),
+      const SizedBox(width: 6),
+      Expanded(
+        child: Text(
+          text,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: style,
+        ),
+      ),
+    ],
+  );
+}
+
+String _relativePathFor(GraphNode node) {
+  return (node.metadata['relativePath'] as String?) ?? node.label;
 }
 
 class GraphEdgePainter extends CustomPainter {
@@ -642,6 +1190,48 @@ class GraphBackgroundPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class GraphUndoManager {
+  GraphUndoManager({this.capacity = 50});
+
+  final int capacity;
+  final List<RvgDocument> _undoStack = <RvgDocument>[];
+  final List<RvgDocument> _redoStack = <RvgDocument>[];
+
+  bool get canUndo => _undoStack.isNotEmpty;
+  bool get canRedo => _redoStack.isNotEmpty;
+
+  void push(RvgDocument snapshot) {
+    if (_undoStack.length == capacity) {
+      _undoStack.removeAt(0);
+    }
+    _undoStack.add(snapshot);
+    _redoStack.clear();
+  }
+
+  RvgDocument? undo(RvgDocument current) {
+    if (_undoStack.isEmpty) {
+      return null;
+    }
+    final RvgDocument previous = _undoStack.removeLast();
+    _redoStack.add(current);
+    return previous;
+  }
+
+  RvgDocument? redo(RvgDocument current) {
+    if (_redoStack.isEmpty) {
+      return null;
+    }
+    final RvgDocument next = _redoStack.removeLast();
+    _undoStack.add(current);
+    return next;
+  }
+
+  void reset() {
+    _undoStack.clear();
+    _redoStack.clear();
+  }
 }
 
 Color _colorWithOpacity(Color color, double opacity) {
