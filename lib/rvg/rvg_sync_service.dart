@@ -64,7 +64,7 @@ class RvgSyncService {
         position: existing?.position ?? _autoPosition(index, entry.isDirectory),
         size:
             existing?.size ??
-            (entry.isDirectory ? const Size(240, 140) : const Size(200, 100)),
+            (entry.isDirectory ? const Size(260, 220) : const Size(240, 220)),
         connections: existing?.connections ?? const <String>[],
         filePath: entry.absolutePath,
         metadata: <String, dynamic>{
@@ -72,6 +72,11 @@ class RvgSyncService {
           _rootKey: workspaceRoot.path,
           _relativePathKey: entry.relativePath,
           _isDirectoryKey: entry.isDirectory,
+          'extension': p.extension(entry.relativePath).toLowerCase(),
+          if (entry.sizeBytes != null) 'sizeBytes': entry.sizeBytes,
+          if (entry.itemCount != null) 'itemCount': entry.itemCount,
+          if (entry.sampleChildren != null && entry.sampleChildren!.isNotEmpty)
+            'sampleChildren': entry.sampleChildren,
         },
       );
 
@@ -165,12 +170,26 @@ class RvgSyncService {
         }
         final bool isDirectory = entity is Directory;
         final String relativePath = p.relative(entity.path, from: root.path);
+        int? itemCount;
+        List<String>? sampleChildren;
+        int? sizeBytes;
+        if (entity is Directory) {
+          final _FolderPreview preview = await _folderPreview(entity);
+          itemCount = preview.count;
+          sampleChildren = preview.sampleNames;
+        } else if (entity is File) {
+          final FileStat stat = await entity.stat();
+          sizeBytes = stat.size;
+        }
         entries.add(
           _FsEntry(
             absolutePath: entity.path,
             relativePath: relativePath,
             displayName: name,
             isDirectory: isDirectory,
+            itemCount: itemCount,
+            sampleChildren: sampleChildren,
+            sizeBytes: sizeBytes,
           ),
         );
       }
@@ -197,6 +216,28 @@ class RvgSyncService {
     }
     return false;
   }
+
+  Future<_FolderPreview> _folderPreview(Directory directory) async {
+    int count = 0;
+    final List<String> sampleNames = <String>[];
+    try {
+      await for (final FileSystemEntity entity in directory.list(
+        recursive: false,
+      )) {
+        final String name = p.basename(entity.path);
+        if (_shouldSkipName(name)) {
+          continue;
+        }
+        count += 1;
+        if (sampleNames.length < 3) {
+          sampleNames.add(name);
+        }
+      }
+    } catch (error) {
+      // ignore, captured via warnings in outer loop.
+    }
+    return _FolderPreview(count: count, sampleNames: sampleNames);
+  }
 }
 
 class _DirectorySnapshot {
@@ -215,10 +256,23 @@ class _FsEntry {
     required this.relativePath,
     required this.displayName,
     required this.isDirectory,
+    this.itemCount,
+    this.sampleChildren,
+    this.sizeBytes,
   });
 
   final String absolutePath;
   final String relativePath;
   final String displayName;
   final bool isDirectory;
+  final int? itemCount;
+  final List<String>? sampleChildren;
+  final int? sizeBytes;
+}
+
+class _FolderPreview {
+  const _FolderPreview({required this.count, required this.sampleNames});
+
+  final int count;
+  final List<String> sampleNames;
 }

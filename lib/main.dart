@@ -3,11 +3,12 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-
+import 'package:path/path.dart' as p;
 import 'package:repoview_flutter/rvg/rvg_models.dart';
 import 'package:repoview_flutter/rvg/rvg_persistence_service.dart';
 import 'package:repoview_flutter/rvg/rvg_types.dart';
 import 'package:repoview_flutter/rvg/rvg_sync_service.dart';
+import 'package:repoview_flutter/services/file_preview_cache.dart';
 
 void main() {
   runApp(const GraphApp());
@@ -39,12 +40,57 @@ class GraphPage extends StatefulWidget {
 
 class _GraphPageState extends State<GraphPage> {
   static const Size _canvasSize = Size(1400, 900);
+  static const Set<String> _imageExtensions = <String>{
+    '.png',
+    '.jpg',
+    '.jpeg',
+    '.gif',
+    '.bmp',
+    '.webp',
+  };
+  static const Set<String> _markdownExtensions = <String>{
+    '.md',
+    '.markdown',
+    '.mdown',
+    '.mdx',
+  };
+  static const Set<String> _textExtensions = <String>{
+    '.txt',
+    '.json',
+    '.yaml',
+    '.yml',
+    '.csv',
+    '.tsv',
+    '.dart',
+    '.js',
+    '.ts',
+    '.jsx',
+    '.tsx',
+    '.java',
+    '.kt',
+    '.kts',
+    '.swift',
+    '.py',
+    '.rb',
+    '.go',
+    '.rs',
+    '.c',
+    '.cc',
+    '.cpp',
+    '.h',
+    '.hpp',
+    '.cs',
+    '.sh',
+    '.bat',
+    '.ps1',
+  };
 
   late final RvgPersistenceService _persistenceService;
   late final GraphUndoManager _undoManager;
   late final File _documentFile;
   late final Directory _workspaceRoot;
   late final RvgSyncService _syncService;
+  late final FilePreviewCache _previewCache;
   late final Map<GraphShapeType, GraphShapeDelegate> _shapeRegistry;
   late RvgDocument _document;
   late List<GraphNode> _nodes;
@@ -53,6 +99,9 @@ class _GraphPageState extends State<GraphPage> {
   StreamSubscription<FileSystemEvent>? _watchSubscription;
   Timer? _syncDebounce;
   RvgDocument? _dragSnapshot;
+  final Map<String, CachedPreview?> _nodePreviews = <String, CachedPreview?>{};
+  final Set<String> _previewRequests = <String>{};
+  late final Map<RvgVisualType, String> _typeDefaultViews;
 
   @override
   void initState() {
@@ -60,6 +109,7 @@ class _GraphPageState extends State<GraphPage> {
     _persistenceService = const RvgPersistenceService();
     _undoManager = GraphUndoManager(capacity: 50);
     _syncService = const RvgSyncService();
+    _previewCache = FilePreviewCache(maxEntries: 150);
     _workspaceRoot = Directory(
       '${Directory.systemTemp.path}/repoview-demo-workspace',
     );
@@ -70,6 +120,14 @@ class _GraphPageState extends State<GraphPage> {
     };
     _document = RvgDocument.demo();
     _nodes = _document.nodes.map(GraphNode.fromRvgNode).toList();
+    _typeDefaultViews = <RvgVisualType, String>{
+      RvgVisualType.file: FileNodeView.preview.id,
+      RvgVisualType.folder: FolderNodeView.summary.id,
+      RvgVisualType.rectangle: RectangleNodeView.standard.id,
+      RvgVisualType.circle: CircleNodeView.standard.id,
+      RvgVisualType.external: RectangleNodeView.standard.id,
+      RvgVisualType.note: RectangleNodeView.standard.id,
+    };
     unawaited(_bootstrapWorkspace());
   }
 
@@ -77,6 +135,7 @@ class _GraphPageState extends State<GraphPage> {
   void dispose() {
     _watchSubscription?.cancel();
     _syncDebounce?.cancel();
+    _previewCache.clear();
     super.dispose();
   }
 
@@ -152,6 +211,13 @@ class _GraphPageState extends State<GraphPage> {
     }
     final theme = Theme.of(context);
     final bool isCircle = node.shape == GraphShapeType.circle;
+    _ensurePreview(node);
+    final CachedPreview? preview = _nodePreviews[node.id];
+    final List<NodeViewOption> viewOptions = _viewOptionsFor(node, preview);
+    if (viewOptions.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final NodeViewOption activeView = _resolveActiveView(node, viewOptions);
 
     return Positioned(
       left: node.position.dx,
@@ -160,14 +226,22 @@ class _GraphPageState extends State<GraphPage> {
         onPanStart: (_) => _beginNodeDrag(),
         onPanEnd: (_) => _endNodeDrag(),
         onTap: () => _handleNodeTap(node),
+        onDoubleTap: () => unawaited(_cycleNodeView(node, preview)),
+        onSecondaryTapUp:
+            (details) => unawaited(
+              _showViewMenu(node, preview, activeView, details.globalPosition),
+            ),
         onPanUpdate: (details) => _handleNodePan(node.id, details.delta),
         child: _buildNodeShadow(
           node: node,
           isCircle: isCircle,
           child: delegate.buildNode(
+            context,
             node,
             isSelected: node.id == _selectedNodeId,
             theme: theme,
+            preview: preview,
+            view: activeView,
           ),
         ),
       ),
@@ -236,6 +310,9 @@ class _GraphPageState extends State<GraphPage> {
         fallback: _document,
       );
       _undoManager.reset();
+      _previewCache.clear();
+      _nodePreviews.clear();
+      _previewRequests.clear();
       _dragSnapshot = null;
       setState(() {
         _document = loaded;
@@ -267,6 +344,7 @@ class _GraphPageState extends State<GraphPage> {
       } else if (nextSelection != null) {
         _selectedNodeId = nextSelection;
       }
+      _cleanupMissingPreviews(_nodes);
     });
     if (!persist) {
       return;
@@ -352,6 +430,305 @@ class _GraphPageState extends State<GraphPage> {
       }
       unawaited(_runSync(silent: true));
     });
+  }
+
+  void _ensurePreview(GraphNode node) {
+    if (node.visualType != RvgVisualType.file) {
+      return;
+    }
+    if (_nodePreviews.containsKey(node.id) ||
+        _previewRequests.contains(node.id)) {
+      return;
+    }
+    final String? absolutePath = _resolveNodeAbsolutePath(node);
+    if (absolutePath == null) {
+      _nodePreviews[node.id] = null;
+      return;
+    }
+    final String extension = p.extension(absolutePath).toLowerCase();
+    final File file = File(absolutePath);
+    Future<CachedPreview?>? future;
+    if (_imageExtensions.contains(extension)) {
+      future = _previewCache.getImagePreview(file);
+    } else if (_markdownExtensions.contains(extension)) {
+      future = _previewCache.getMarkdownPreview(file);
+    } else if (_textExtensions.contains(extension)) {
+      future = _previewCache.getTextPreview(file, maxLength: 6000);
+    } else {
+      _nodePreviews[node.id] = null;
+      return;
+    }
+
+    _previewRequests.add(node.id);
+    future
+        .then((CachedPreview? preview) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _nodePreviews[node.id] = preview;
+          });
+        })
+        .catchError((Object error, StackTrace stackTrace) {
+          debugPrint('Preview load failed for ${node.id}: $error');
+          debugPrint('$stackTrace');
+        })
+        .whenComplete(() {
+          _previewRequests.remove(node.id);
+        });
+  }
+
+  String? _resolveNodeAbsolutePath(GraphNode node) {
+    if (node.sourcePath != null && node.sourcePath!.isNotEmpty) {
+      return node.sourcePath;
+    }
+    final String? relative = node.metadata['relativePath'] as String?;
+    if (relative == null) {
+      return null;
+    }
+    return p.join(_workspaceRoot.path, relative);
+  }
+
+  void _cleanupMissingPreviews(List<GraphNode> nodes) {
+    final Set<String> ids = nodes.map((GraphNode node) => node.id).toSet();
+    _nodePreviews.removeWhere((String key, CachedPreview? value) {
+      return !ids.contains(key);
+    });
+    _previewRequests.removeWhere((String key) => !ids.contains(key));
+  }
+
+  List<NodeViewOption> _viewOptionsFor(GraphNode node, CachedPreview? preview) {
+    List<NodeViewOption> candidates;
+    switch (node.visualType) {
+      case RvgVisualType.file:
+        candidates = FileNodeView.all;
+        break;
+      case RvgVisualType.folder:
+        candidates = FolderNodeView.all;
+        break;
+      case RvgVisualType.circle:
+        candidates = const <NodeViewOption>[CircleNodeView.standard];
+        break;
+      default:
+        candidates = const <NodeViewOption>[RectangleNodeView.standard];
+        break;
+    }
+    return <NodeViewOption>[
+      for (final NodeViewOption option in candidates)
+        if (option.supports == null || option.supports!(node, preview)) option,
+    ];
+  }
+
+  NodeViewOption _resolveActiveView(
+    GraphNode node,
+    List<NodeViewOption> options,
+  ) {
+    NodeViewOption? byId(String? id) {
+      if (id == null) return null;
+      for (final NodeViewOption option in options) {
+        if (option.id == id) {
+          return option;
+        }
+      }
+      return null;
+    }
+
+    final NodeViewOption? stored = byId(node.metadata['activeView'] as String?);
+    if (stored != null) {
+      return stored;
+    }
+
+    final NodeViewOption? typeDefault = byId(
+      _typeDefaultViews[node.visualType],
+    );
+    if (typeDefault != null) {
+      return typeDefault;
+    }
+
+    return options.first;
+  }
+
+  Future<void> _cycleNodeView(GraphNode node, CachedPreview? preview) async {
+    final List<NodeViewOption> options = _viewOptionsFor(node, preview);
+    if (options.length <= 1) {
+      return;
+    }
+    final NodeViewOption current = _resolveActiveView(node, options);
+    final int index = options.indexOf(current);
+    final NodeViewOption next = options[(index + 1) % options.length];
+    await _selectNodeView(node, next, preview: preview);
+  }
+
+  Future<void> _showViewMenu(
+    GraphNode node,
+    CachedPreview? preview,
+    NodeViewOption activeView,
+    Offset position,
+  ) async {
+    final List<NodeViewOption> options = _viewOptionsFor(node, preview);
+    final String? selection = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        for (final NodeViewOption option in options)
+          PopupMenuItem<String>(
+            value: 'view:${option.id}',
+            child: Row(
+              children: [
+                if (option.id == activeView.id)
+                  const Icon(Icons.check, size: 16)
+                else
+                  const SizedBox(width: 16),
+                const SizedBox(width: 8),
+                Text(option.label),
+              ],
+            ),
+          ),
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: 'set-default:${activeView.id}',
+          child: Text('Set "${activeView.label}" as default'),
+        ),
+        PopupMenuItem<String>(
+          value: 'open-window:${activeView.id}',
+          enabled: activeView.requiresWindow,
+          child: const Text('Open view in window'),
+        ),
+      ],
+    );
+    if (selection == null) {
+      return;
+    }
+    if (selection.startsWith('view:')) {
+      final String id = selection.substring('view:'.length);
+      final NodeViewOption option = options.firstWhere(
+        (o) => o.id == id,
+        orElse: () => activeView,
+      );
+      await _selectNodeView(node, option, preview: preview);
+    } else if (selection.startsWith('set-default:')) {
+      final String id = selection.substring('set-default:'.length);
+      final NodeViewOption option = options.firstWhere(
+        (o) => o.id == id,
+        orElse: () => activeView,
+      );
+      setState(() {
+        _typeDefaultViews[node.visualType] = option.id;
+      });
+      await _selectNodeView(
+        node,
+        option,
+        preview: preview,
+        setTypeDefault: true,
+      );
+    } else if (selection.startsWith('open-window:')) {
+      await _openViewWindow(node);
+    }
+  }
+
+  Future<void> _selectNodeView(
+    GraphNode node,
+    NodeViewOption option, {
+    CachedPreview? preview,
+    bool setTypeDefault = false,
+    bool recordUndo = true,
+  }) async {
+    final RvgDocument updated = _document.updateNode(node.id, (
+      RvgNode original,
+    ) {
+      final Map<String, dynamic> metadata = Map<String, dynamic>.from(
+        original.metadata,
+      );
+      metadata['activeView'] = option.id;
+      return original.copyWith(metadata: metadata);
+    });
+
+    final bool changed = !identical(updated, _document);
+    if (changed) {
+      _commitDocument(updated, recordUndo: recordUndo);
+    } else if (setTypeDefault) {
+      setState(() {});
+    }
+
+    if (setTypeDefault) {
+      setState(() {
+        _typeDefaultViews[node.visualType] = option.id;
+      });
+    }
+
+    if (option.requiresWindow) {
+      await _openViewWindow(node);
+    }
+  }
+
+  Future<void> _openViewWindow(GraphNode node) async {
+    final String? absolutePath = _resolveNodeAbsolutePath(node);
+    if (absolutePath == null) {
+      return;
+    }
+    final File file = File(absolutePath);
+    if (!await file.exists()) {
+      return;
+    }
+
+    final String extension = p.extension(absolutePath).toLowerCase();
+    Widget content;
+    if (_imageExtensions.contains(extension)) {
+      content = InteractiveViewer(
+        minScale: 0.2,
+        maxScale: 4,
+        child: Image.file(file, fit: BoxFit.contain),
+      );
+    } else {
+      String data;
+      try {
+        data = await file.readAsString();
+      } catch (error) {
+        data = 'Unable to load file: $error';
+      }
+      content = Scrollbar(
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: SelectableText(data),
+        ),
+      );
+    }
+
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return Dialog(
+          child: SizedBox(
+            width: 720,
+            height: 540,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    node.label,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(child: content),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   GraphNode? _findNodeById(String id) {
@@ -599,9 +976,12 @@ abstract class GraphShapeDelegate {
   const GraphShapeDelegate();
 
   Widget buildNode(
+    BuildContext context,
     GraphNode node, {
     required bool isSelected,
     required ThemeData theme,
+    CachedPreview? preview,
+    required NodeViewOption view,
   });
 
   Offset anchorFor(GraphNode node, AnchorSide side);
@@ -612,9 +992,12 @@ class RectangleNodeShape extends GraphShapeDelegate {
 
   @override
   Widget buildNode(
+    BuildContext context,
     GraphNode node, {
     required bool isSelected,
     required ThemeData theme,
+    CachedPreview? preview,
+    required NodeViewOption view,
   }) {
     Color background = isSelected ? Colors.indigo.shade50 : Colors.white;
     Color borderColor = isSelected ? Colors.indigo : Colors.grey.shade400;
@@ -623,45 +1006,34 @@ class RectangleNodeShape extends GraphShapeDelegate {
     BorderRadius borderRadius = BorderRadius.circular(14);
     Widget child = _buildDefaultRectangularContent(node, theme, isSelected);
 
-    switch (node.visualType) {
-      case RvgVisualType.folder:
-        background = isSelected ? Colors.amber.shade100 : Colors.amber.shade50;
-        borderColor =
-            isSelected ? Colors.amber.shade700 : Colors.amber.shade200;
-        borderWidth = isSelected ? 3 : 2;
-        padding = const EdgeInsets.fromLTRB(18, 16, 18, 14);
-        child = _buildFolderContent(node, theme);
-        break;
-      case RvgVisualType.file:
-        background =
-            isSelected ? Colors.blueGrey.shade100 : Colors.blueGrey.shade50;
-        borderColor =
-            isSelected ? Colors.blueGrey.shade700 : Colors.blueGrey.shade200;
-        borderWidth = isSelected ? 3 : 1.8;
-        padding = const EdgeInsets.fromLTRB(18, 14, 18, 14);
-        child = _buildFileContent(node, theme);
-        break;
-      case RvgVisualType.note:
-        background =
-            isSelected ? Colors.orange.shade100 : Colors.orange.shade50;
-        borderColor =
-            isSelected ? Colors.orange.shade700 : Colors.orange.shade200;
-        borderWidth = isSelected ? 3 : 2;
-        padding = const EdgeInsets.fromLTRB(18, 18, 18, 16);
-        child = _buildNoteContent(node, theme);
-        break;
-      case RvgVisualType.external:
-        background =
-            isSelected ? Colors.teal.shade100 : Colors.tealAccent.shade100;
-        borderColor = isSelected ? Colors.teal.shade700 : Colors.teal.shade200;
-        borderWidth = isSelected ? 3 : 2;
-        padding = const EdgeInsets.fromLTRB(18, 16, 18, 16);
-        child = _buildExternalContent(node, theme);
-        break;
-      case RvgVisualType.rectangle:
-      case RvgVisualType.circle:
-        // Use defaults; circle handled by CircleNodeShape.
-        break;
+    if (node.visualType == RvgVisualType.folder) {
+      background = isSelected ? Colors.amber.shade100 : Colors.amber.shade50;
+      borderColor = isSelected ? Colors.amber.shade700 : Colors.amber.shade200;
+      borderWidth = isSelected ? 3 : 2;
+      padding = const EdgeInsets.fromLTRB(18, 16, 18, 14);
+      child = _buildFolderContent(node, theme, view.id);
+    } else if (node.visualType == RvgVisualType.file) {
+      background =
+          isSelected ? Colors.blueGrey.shade100 : Colors.blueGrey.shade50;
+      borderColor =
+          isSelected ? Colors.blueGrey.shade700 : Colors.blueGrey.shade200;
+      borderWidth = isSelected ? 3 : 1.8;
+      padding = const EdgeInsets.fromLTRB(18, 14, 18, 14);
+      child = _buildFileContent(node, theme, view, preview);
+    } else if (node.visualType == RvgVisualType.note) {
+      background = isSelected ? Colors.orange.shade100 : Colors.orange.shade50;
+      borderColor =
+          isSelected ? Colors.orange.shade700 : Colors.orange.shade200;
+      borderWidth = isSelected ? 3 : 2;
+      padding = const EdgeInsets.fromLTRB(18, 18, 18, 16);
+      child = _buildNoteContent(node, theme);
+    } else if (node.visualType == RvgVisualType.external) {
+      background =
+          isSelected ? Colors.teal.shade100 : Colors.tealAccent.shade100;
+      borderColor = isSelected ? Colors.teal.shade700 : Colors.teal.shade200;
+      borderWidth = isSelected ? 3 : 2;
+      padding = const EdgeInsets.fromLTRB(18, 16, 18, 16);
+      child = _buildExternalContent(node, theme);
     }
 
     return Container(
@@ -703,9 +1075,12 @@ class CircleNodeShape extends GraphShapeDelegate {
 
   @override
   Widget buildNode(
+    BuildContext context,
     GraphNode node, {
     required bool isSelected,
     required ThemeData theme,
+    CachedPreview? preview,
+    required NodeViewOption view,
   }) {
     final double diameter = node.size.shortestSide;
     return Container(
@@ -786,7 +1161,7 @@ Widget _buildDefaultRectangularContent(
   );
 }
 
-Widget _buildFolderContent(GraphNode node, ThemeData theme) {
+Widget _buildFolderContent(GraphNode node, ThemeData theme, String viewId) {
   final TextStyle titleStyle =
       theme.textTheme.titleMedium?.copyWith(
         color: Colors.amber.shade900,
@@ -801,10 +1176,41 @@ Widget _buildFolderContent(GraphNode node, ThemeData theme) {
       theme.textTheme.bodyMedium?.copyWith(color: Colors.brown.shade600) ??
       TextStyle(color: Colors.brown.shade600, fontSize: 13);
   final String relativePath = _relativePathFor(node);
+  final int? itemCount = (node.metadata['itemCount'] as num?)?.toInt();
+  final List<String> sampleChildren =
+      ((node.metadata['sampleChildren'] as List?) ?? const <dynamic>[])
+          .cast<String>();
+
+  if (viewId == FolderNodeView.children.id) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Contents', style: titleStyle),
+        const SizedBox(height: 8),
+        Expanded(
+          child:
+              sampleChildren.isEmpty
+                  ? Center(child: Text('No items found', style: bodyStyle))
+                  : ListView.separated(
+                    physics: const BouncingScrollPhysics(),
+                    itemCount: sampleChildren.length,
+                    itemBuilder: (BuildContext context, int index) {
+                      return Text(
+                        sampleChildren[index],
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: bodyStyle,
+                      );
+                    },
+                    separatorBuilder: (_, __) => const Divider(height: 8),
+                  ),
+        ),
+      ],
+    );
+  }
 
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
-    mainAxisAlignment: MainAxisAlignment.center,
     children: [
       Row(
         children: [
@@ -820,18 +1226,59 @@ Widget _buildFolderContent(GraphNode node, ThemeData theme) {
           ),
         ],
       ),
-      const SizedBox(height: 10),
+      const SizedBox(height: 8),
       _buildMetadataLine(
         icon: Icons.folder_open,
         iconColor: Colors.amber.shade700,
         text: relativePath,
         style: bodyStyle,
       ),
+      if (itemCount != null) ...[
+        const SizedBox(height: 4),
+        _buildMetadataLine(
+          icon: Icons.inventory_2,
+          iconColor: Colors.amber.shade400,
+          text: '$itemCount item${itemCount == 1 ? '' : 's'}',
+          style: bodyStyle,
+        ),
+      ],
+      if (sampleChildren.isNotEmpty) ...[
+        const SizedBox(height: 6),
+        Flexible(
+          child: SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children:
+                  sampleChildren
+                      .map(
+                        (String name) => Chip(
+                          label: Text(name, style: bodyStyle),
+                          backgroundColor: Colors.amber.shade100,
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          visualDensity: VisualDensity.compact,
+                          side: BorderSide(
+                            color: Colors.amber.shade300,
+                            width: 0.5,
+                          ),
+                        ),
+                      )
+                      .toList(),
+            ),
+          ),
+        ),
+      ],
     ],
   );
 }
 
-Widget _buildFileContent(GraphNode node, ThemeData theme) {
+Widget _buildFileContent(
+  GraphNode node,
+  ThemeData theme,
+  NodeViewOption view,
+  CachedPreview? preview,
+) {
   final TextStyle titleStyle =
       theme.textTheme.titleMedium?.copyWith(
         color: Colors.blueGrey.shade900,
@@ -847,10 +1294,61 @@ Widget _buildFileContent(GraphNode node, ThemeData theme) {
       TextStyle(color: Colors.blueGrey.shade600, fontSize: 13);
   final String relativePath = _relativePathFor(node);
   final String origin = (node.metadata['origin'] as String?) ?? 'manual';
+  final int? sizeBytes = (node.metadata['sizeBytes'] as num?)?.toInt();
 
-  return Column(
+  if (view.id == FileNodeView.details.id) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Details', style: titleStyle),
+        const SizedBox(height: 8),
+        _buildMetadataLine(
+          icon: Icons.folder,
+          iconColor: Colors.blueGrey.shade400,
+          text: relativePath,
+          style: bodyStyle,
+        ),
+        const SizedBox(height: 4),
+        _buildMetadataLine(
+          icon: Icons.link,
+          iconColor: Colors.blueGrey.shade400,
+          text: origin == 'filesystem' ? 'Synced file' : 'Linked asset',
+          style: bodyStyle,
+        ),
+        if (sizeBytes != null) ...[
+          const SizedBox(height: 4),
+          _buildMetadataLine(
+            icon: Icons.data_object,
+            iconColor: Colors.blueGrey.shade300,
+            text: _formatSize(sizeBytes),
+            style: bodyStyle,
+          ),
+        ],
+        const SizedBox(height: 4),
+        _buildMetadataLine(
+          icon: Icons.description_outlined,
+          iconColor: Colors.blueGrey.shade300,
+          text: 'Extension: ${node.metadata['extension'] ?? 'unknown'}',
+          style: bodyStyle,
+        ),
+      ],
+    );
+  }
+
+  if (view.id == FileNodeView.full.id) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Full View', style: titleStyle),
+        const SizedBox(height: 8),
+        Text('Open full content from the context menu.', style: bodyStyle),
+      ],
+    );
+  }
+
+  final Widget header = Column(
     crossAxisAlignment: CrossAxisAlignment.start,
-    mainAxisAlignment: MainAxisAlignment.center,
+    mainAxisSize: MainAxisSize.min,
     children: [
       Row(
         children: [
@@ -883,6 +1381,28 @@ Widget _buildFileContent(GraphNode node, ThemeData theme) {
         text: origin == 'filesystem' ? 'Synced file' : 'Linked asset',
         style: bodyStyle,
       ),
+      if (sizeBytes != null) ...[
+        const SizedBox(height: 4),
+        _buildMetadataLine(
+          icon: Icons.data_object,
+          iconColor: Colors.blueGrey.shade300,
+          text: _formatSize(sizeBytes),
+          style: bodyStyle,
+        ),
+      ],
+    ],
+  );
+
+  if (view.id == FileNodeView.summary.id || preview == null) {
+    return header;
+  }
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      header,
+      const SizedBox(height: 8),
+      Expanded(child: _buildPreviewWidget(preview, theme)),
     ],
   );
 }
@@ -1007,6 +1527,184 @@ Widget _buildMetadataLine({
 
 String _relativePathFor(GraphNode node) {
   return (node.metadata['relativePath'] as String?) ?? node.label;
+}
+
+Widget _buildPreviewWidget(CachedPreview preview, ThemeData theme) {
+  if (preview.type == PreviewType.image) {
+    if (preview.data == null) {
+      return const SizedBox.shrink();
+    }
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox.expand(
+            child: Image.memory(
+              preview.data!,
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.medium,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  if (preview.type == PreviewType.markdown ||
+      preview.type == PreviewType.text) {
+    final String snippet = _formatPreviewText(preview.text ?? '');
+    if (snippet.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final TextStyle style =
+        theme.textTheme.bodyMedium?.copyWith(
+          color: Colors.blueGrey.shade800,
+          fontFamily: 'monospace',
+          height: 1.3,
+        ) ??
+        TextStyle(
+          color: Colors.blueGrey.shade800,
+          fontFamily: 'monospace',
+          height: 1.3,
+        );
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.blueGrey.shade100, width: 1),
+      ),
+      child: SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        child: Text(
+          snippet,
+          maxLines: 6,
+          overflow: TextOverflow.ellipsis,
+          softWrap: true,
+          style: style,
+        ),
+      ),
+    );
+  }
+
+  return const SizedBox.shrink();
+}
+
+String _formatPreviewText(String raw) {
+  if (raw.isEmpty) {
+    return raw;
+  }
+  final List<String> lines =
+      raw
+          .replaceAll('\r\n', '\n')
+          .split('\n')
+          .map((String line) {
+            String trimmed = line.trim();
+            trimmed = trimmed.replaceFirst(RegExp(r'^#{1,6}\s*'), '');
+            trimmed = trimmed.replaceFirst(RegExp(r'^[-*+]\s+'), '• ');
+            return trimmed;
+          })
+          .where((String line) => line.isNotEmpty)
+          .take(8)
+          .toList();
+  String combined = lines.join('\n');
+  if (combined.length > 400) {
+    combined = '${combined.substring(0, 400)}…';
+  }
+  return combined;
+}
+
+String _formatSize(int bytes) {
+  const List<String> units = <String>['B', 'KB', 'MB', 'GB', 'TB'];
+  double value = bytes.toDouble();
+  int unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  final String formatted =
+      unitIndex == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(1);
+  return '$formatted ${units[unitIndex]}';
+}
+
+class NodeViewOption {
+  const NodeViewOption({
+    required this.id,
+    required this.label,
+    this.requiresWindow = false,
+    this.supports,
+  });
+
+  final String id;
+  final String label;
+  final bool requiresWindow;
+  final bool Function(GraphNode node, CachedPreview? preview)? supports;
+}
+
+class FileNodeView {
+  static const NodeViewOption preview = NodeViewOption(
+    id: 'file.preview',
+    label: 'Preview',
+    supports: _supportsPreview,
+  );
+  static const NodeViewOption summary = NodeViewOption(
+    id: 'file.summary',
+    label: 'Summary',
+  );
+  static const NodeViewOption details = NodeViewOption(
+    id: 'file.details',
+    label: 'Details',
+  );
+  static const NodeViewOption full = NodeViewOption(
+    id: 'file.full',
+    label: 'Full Content',
+    requiresWindow: true,
+  );
+
+  static bool _supportsPreview(GraphNode node, CachedPreview? preview) {
+    return preview != null;
+  }
+
+  static const List<NodeViewOption> all = <NodeViewOption>[
+    preview,
+    summary,
+    details,
+    full,
+  ];
+}
+
+class FolderNodeView {
+  static const NodeViewOption summary = NodeViewOption(
+    id: 'folder.summary',
+    label: 'Summary',
+  );
+  static const NodeViewOption children = NodeViewOption(
+    id: 'folder.children',
+    label: 'Child List',
+    supports: _supportsChildren,
+  );
+
+  static bool _supportsChildren(GraphNode node, CachedPreview? preview) {
+    final dynamic sample = node.metadata['sampleChildren'];
+    return sample is List && sample.isNotEmpty;
+  }
+
+  static const List<NodeViewOption> all = <NodeViewOption>[summary, children];
+}
+
+class RectangleNodeView {
+  static const NodeViewOption standard = NodeViewOption(
+    id: 'rect.standard',
+    label: 'Standard',
+  );
+}
+
+class CircleNodeView {
+  static const NodeViewOption standard = NodeViewOption(
+    id: 'circle.standard',
+    label: 'Standard',
+  );
 }
 
 class GraphEdgePainter extends CustomPainter {

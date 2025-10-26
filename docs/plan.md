@@ -22,10 +22,11 @@
 
 ## Phase 3 – File-Type Visuals
 - [ ] Catalog file-type visualizations: images, text previews, code summaries, README markdown, folders as tree widgets.
-- [ ] Create pluggable renderer interface so each file type defines its own widget and metadata.
-- [ ] Implement lazy-loading and caching for heavy assets (large images, markdown rendering).
+- [ ] Create pluggable renderer interface so each file type defines its own widget, metadata, and exposes named “views.”
+- [ ] Implement lazy-loading and caching for heavy assets (large images, markdown rendering) with configurable view limits.
 - [ ] Support external file references (shift-drag) alongside imported copies; reflect path provenance in UI.
-- [ ] Expose quick actions (open in editor, reveal in finder, duplicate) per node.
+- [ ] Expose quick actions (open in editor, reveal in finder, duplicate) per node and add context menu to switch available views.
+- [ ] Persist per-node view preference and allow double-click to cycle through view variants; open oversized views in auxiliary overlay windows.
 
 ## Phase 4 – Repo Integration & Collaboration
 - [ ] Integrate with Git status (untracked/modified indicators, branch, commit history overlays).

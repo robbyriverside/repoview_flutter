@@ -73,6 +73,23 @@ void main() {
           fsNodes.any((node) => node.metadata['relativePath'] == 'folderB'),
           isTrue,
         );
+
+        final RvgNode fileNode = fsNodes.firstWhere(
+          (node) => node.metadata['relativePath'] == 'fileA.txt',
+        );
+        expect(fileNode.metadata['extension'], '.txt');
+        expect(fileNode.metadata['sizeBytes'], greaterThan(0));
+        expect(fileNode.metadata['isDirectory'], isFalse);
+
+        final RvgNode folderNode = fsNodes.firstWhere(
+          (node) => node.metadata['relativePath'] == 'folderB',
+        );
+        expect(folderNode.metadata['isDirectory'], isTrue);
+        expect(folderNode.metadata['itemCount'], 0);
+        expect(
+          (folderNode.metadata['sampleChildren'] as List?)?.isEmpty ?? true,
+          isTrue,
+        );
       },
     );
 
