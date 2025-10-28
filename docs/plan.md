@@ -29,18 +29,18 @@
 - [ ] Persist per-node view preference and allow double-click to cycle through view variants; open oversized views in auxiliary overlay windows.
 
 ## Phase 4 – Repo Integration & Collaboration
-- [ ] Integrate with Git status (untracked/modified indicators, branch, commit history overlays).
-- [ ] Provide Git actions (stage, commit, diff) directly from node context menus when repo is detected.
-- [ ] Sync with remote providers (GitHub, Azure DevOps) for metadata and optional cloud backup of RVG files.
-- [ ] Implement multi-user merge helpers for RVG JSON (visual diff, conflict resolution UI).
-- [ ] Add presence or change-feed for collaborative editing roadmap (initially read-only indicators).
+- [x] Integrate with Git status (untracked/modified indicators, branch, commit history overlays).
+- [x] Provide Git actions (stage, commit, diff) directly from node context menus when repo is detected.
+- [x] Sync with remote providers (GitHub, Azure DevOps) for metadata and optional cloud backup of RVG files.
+- [x] Implement multi-user merge helpers for RVG JSON (visual diff, conflict resolution UI).
+- [x] Add presence or change-feed for collaborative editing roadmap (initially read-only indicators).
 
 ## Phase 5 – Automation & Intelligence
-- [ ] Develop layout formatters (grid, mind map, orthogonal) with configurable parameters.
-- [ ] Integrate AI assistants for auto-tagging nodes, generating summaries, proposing layouts.
-- [ ] Support scripted automations (e.g., create view for new feature branch) via plugin API.
-- [ ] Provide templating system for custom RVG presets (architecture diagrams, kanban boards).
-- [ ] Implement analytics/telemetry pipeline respecting privacy settings.
+- [x] Develop layout formatters (grid, mind map, orthogonal) with configurable parameters.
+- [x] Integrate AI assistants for auto-tagging nodes, generating summaries, proposing layouts.
+- [x] Support scripted automations (e.g., create view for new feature branch) via plugin API.
+- [x] Provide templating system for custom RVG presets (architecture diagrams, kanban boards).
+- [x] Implement analytics/telemetry pipeline respecting privacy settings.
 
 ## Phase 6 – Packaging & Release
 - [ ] Configure cross-platform builds (macOS, Windows, Linux) with code-signing, auto-update strategy.

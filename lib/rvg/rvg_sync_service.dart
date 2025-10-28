@@ -32,6 +32,7 @@ class RvgSyncService {
   Future<RvgSyncResult> syncWithDirectory({
     required RvgDocument document,
     required Directory workspaceRoot,
+    Map<String, Offset>? positionOverrides,
   }) async {
     final DateTime start = DateTime.now().toUtc();
     final Map<String, RvgNode> managedNodes = <String, RvgNode>{};
@@ -57,11 +58,18 @@ class RvgSyncService {
       final String nodeId = _nodeIdForEntry(entry.relativePath);
       final RvgNode? existing = managedNodes[nodeId];
 
+      final Offset? overridePosition =
+          existing == null && positionOverrides != null
+              ? positionOverrides[nodeId]
+              : null;
       final RvgNode candidate = RvgNode(
         id: nodeId,
         label: entry.displayName,
         visual: entry.isDirectory ? RvgVisualType.folder : RvgVisualType.file,
-        position: existing?.position ?? _autoPosition(index, entry.isDirectory),
+        position:
+            overridePosition ??
+            existing?.position ??
+            _autoPosition(index, entry.isDirectory),
         size:
             existing?.size ??
             (entry.isDirectory ? const Size(260, 220) : const Size(240, 220)),

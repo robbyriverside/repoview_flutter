@@ -36,6 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   path: ^1.9.0
   markdown: ^7.3.0
+  collection: ^1.18.0
+  desktop_drop: ^0.5.0
+  cross_file: ^0.3.4+2
 
 dev_dependencies:
   flutter_test:

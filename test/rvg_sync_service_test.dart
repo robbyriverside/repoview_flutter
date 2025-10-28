@@ -124,5 +124,32 @@ void main() {
       expect(result.removedNodes, 1);
       expect(result.document.nodes, isEmpty);
     });
+
+    test('applies position overrides for new nodes', () async {
+      final File fileC = File(p.join(tempDir.path, 'fileC.txt'));
+      await fileC.writeAsString('content');
+
+      final RvgDocument startingDocument = RvgDocument(
+        version: '1.0.0',
+        createdAt: DateTime.utc(2024),
+        updatedAt: DateTime.utc(2024),
+        nodes: const <RvgNode>[],
+      );
+
+      const Offset desiredPosition = Offset(420, 360);
+
+      final RvgSyncResult result = await syncService.syncWithDirectory(
+        document: startingDocument,
+        workspaceRoot: tempDir,
+        positionOverrides: const <String, Offset>{
+          'fs:fileC.txt': desiredPosition,
+        },
+      );
+
+      final RvgNode fileNode = result.document.nodes.singleWhere(
+        (node) => node.id == 'fs:fileC.txt',
+      );
+      expect(fileNode.position, desiredPosition);
+    });
   });
 }

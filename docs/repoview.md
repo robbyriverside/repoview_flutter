@@ -56,3 +56,15 @@ RepoView makes every effort, including using AI, to make a nice looking view.  T
 formatters that can create mind maps or many other ways to cleanup the view.  This will be the
 source of many RepoView enhancements.
 
+## Philosophy
+
+ even though this entire display is based on objects, many of whom relate to files, the fact that
+ their files is not the important part.  If we just wanna look at files, there are plenty of
+ interfaces. That'll do that. This allows us to make a picture of what's in the directory.
+  In that context, the fact that the object correlates to a file is just a implementation detail,
+  not the primary purpose.
+  
+The name of the file should not be shown on the item window.  There's a way to toggle the names
+back on for the entire diagram.  But by default it is off.  The viewer is for displaying the contents of the file, rather
+than it's name.  But the name may be useful as a toggle on the view.  So the filename overlays the
+item window and hence obscures the file contents if any.

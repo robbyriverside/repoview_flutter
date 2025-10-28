@@ -5,6 +5,7 @@
 // gestures. You can also use WidgetTester to find child widgets in the widget
 // tree, read text, and verify that the values of widget properties are correct.
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:repoview_flutter/main.dart';
@@ -17,5 +18,9 @@ void main() {
     expect(find.text('API Gateway'), findsOneWidget);
     expect(find.text('Auth Service'), findsOneWidget);
     expect(find.text('Orders'), findsOneWidget);
+
+    // Dispose the app to allow background timers to cancel cleanly.
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
   });
 }
